@@ -4,6 +4,8 @@
 package cli
 
 import (
+	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/bitwise-media-group/evolve/internal/layout"
@@ -13,12 +15,17 @@ import (
 )
 
 // Thresholds reads report.thresholds from config, falling back to the report
-// package's default pass rates for the keys the config leaves unset.
+// package's default pass rates for the keys the config leaves unset. The gated
+// maturity set reads from report.thresholds.maturity, defaulting to
+// report.DefaultGatedMaturity (all three levels: stable, unstable, prerelease)
+// when unset or when a configured token fails to parse (MaturityConfig reports
+// that error to callers that need to surface it).
 func (o *Options) Thresholds() report.Thresholds {
 	th := report.Thresholds{
 		TriggersMinPassRate: report.DefaultTriggersMinPassRate,
 		EvalsMinPassRate:    report.DefaultEvalsMinPassRate,
 		Models:              o.Viper.GetStringSlice("report.thresholds.models"),
+		Maturity:            slices.Clone(report.DefaultGatedMaturity),
 	}
 	if o.Viper.IsSet("report.thresholds.triggers_min_pass_rate") {
 		th.TriggersMinPassRate = o.Viper.GetFloat64("report.thresholds.triggers_min_pass_rate")
@@ -26,7 +33,43 @@ func (o *Options) Thresholds() report.Thresholds {
 	if o.Viper.IsSet("report.thresholds.evals_min_pass_rate") {
 		th.EvalsMinPassRate = o.Viper.GetFloat64("report.thresholds.evals_min_pass_rate")
 	}
+	if levels, err := o.MaturityConfig(); err == nil && levels != nil {
+		th.Maturity = levels
+	}
 	return th
+}
+
+// MaturityConfig resolves the gated maturity set from report.thresholds.maturity,
+// validating each token via report.ParseMaturity. It returns nil, nil when the
+// key is unset (callers default to report.DefaultGatedMaturity), and a clear
+// error for an unrecognized token — a malformed config value must not
+// silently no-op.
+func (o *Options) MaturityConfig() ([]report.Maturity, error) {
+	if !o.Viper.IsSet("report.thresholds.maturity") {
+		return nil, nil
+	}
+	return parseMaturityLevels(o.Viper.GetStringSlice("report.thresholds.maturity"))
+}
+
+// ParseMaturityFlag parses the comma-separated --maturity flag value into the
+// gated maturity set, validating each token via report.ParseMaturity.
+func ParseMaturityFlag(v string) ([]report.Maturity, error) {
+	return parseMaturityLevels(splitFlag(v))
+}
+
+// parseMaturityLevels parses each token via report.ParseMaturity, rejecting
+// the first unrecognized one with a clear error (a bad value must not
+// silently no-op).
+func parseMaturityLevels(tokens []string) ([]report.Maturity, error) {
+	levels := make([]report.Maturity, 0, len(tokens))
+	for _, t := range tokens {
+		m, ok := report.ParseMaturity(t)
+		if !ok {
+			return nil, fmt.Errorf("unknown maturity level %q (want stable, unstable, or prerelease)", t)
+		}
+		levels = append(levels, m)
+	}
+	return levels, nil
 }
 
 // JUnitPath and CoberturaPath are the configured CI-artifact output paths

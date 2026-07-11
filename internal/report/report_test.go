@@ -303,45 +303,55 @@ func TestCheckThresholds(t *testing.T) {
 		t.Errorf("defaults = %v/%v, want 0.5/0.66", DefaultTriggersMinPassRate, DefaultEvalsMinPassRate)
 	}
 
+	// fixtureRepo's plugin is version 0.1.0 (MaturityUnstable); gate on that
+	// level so these evidence issues surface as FAIL exactly as the pre-maturity
+	// aggregate did, keeping this test's assertions about breach content unchanged.
+	gate := []Maturity{MaturityUnstable}
+
 	// anthropic triggers 1/2 = 50%, cursor 2/2 = 100%.
-	breaches := Check(summary, Thresholds{TriggersMinPassRate: 0.8})
-	if len(breaches) != 1 || !strings.Contains(breaches[0], "anthropic/claude-fable-5") {
-		t.Errorf("breaches = %v, want one for anthropic", breaches)
+	fails, warns := Check(repo, summary, Thresholds{TriggersMinPassRate: 0.8, Maturity: gate})
+	if len(fails) != 1 || !strings.Contains(fails[0], "anthropic/claude-fable-5") {
+		t.Errorf("fails = %v, want one for anthropic", fails)
+	}
+	if len(warns) != 0 {
+		t.Errorf("warns = %v, want none (plugin is gated)", warns)
 	}
 
 	// At the built-in defaults, anthropic triggers sit exactly on the 50% gate
 	// and only its 0/1 evals rate breaches the 66% gate.
-	breaches = Check(summary, Thresholds{
+	fails, _ = Check(repo, summary, Thresholds{
 		TriggersMinPassRate: DefaultTriggersMinPassRate,
 		EvalsMinPassRate:    DefaultEvalsMinPassRate,
+		Maturity:            gate,
 	})
-	if len(breaches) != 1 || !strings.Contains(breaches[0], "evals: anthropic/claude-fable-5") {
-		t.Errorf("breaches = %v, want one evals breach for anthropic", breaches)
+	if len(fails) != 1 || !strings.Contains(fails[0], "evals: anthropic/claude-fable-5") {
+		t.Errorf("fails = %v, want one evals breach for anthropic", fails)
 	}
 
 	// A threshold model with no results is a breach — both gates always run, so
 	// the absence surfaces once per tier.
-	breaches = Check(summary, Thresholds{EvalsMinPassRate: 0.5, Models: []string{"openai/gpt-5.5"}})
-	if len(breaches) != 2 {
-		t.Fatalf("breaches = %v, want missing-results breaches for both tiers", breaches)
+	fails, _ = Check(repo, summary, Thresholds{EvalsMinPassRate: 0.5, Models: []string{"openai/gpt-5.5"}, Maturity: gate})
+	if len(fails) != 2 {
+		t.Fatalf("fails = %v, want missing-results breaches for both tiers", fails)
 	}
-	for _, b := range breaches {
+	for _, b := range fails {
 		if !strings.Contains(b, "no stored results") {
 			t.Errorf("breach = %q, want missing-results breach", b)
 		}
 	}
 
-	if got := Check(summary, Thresholds{TriggersMinPassRate: 0.4}); len(got) != 0 {
-		t.Errorf("breaches = %v, want none at 40%%", got)
+	if got, _ := Check(repo, summary, Thresholds{TriggersMinPassRate: 0.4, Maturity: gate}); len(got) != 0 {
+		t.Errorf("fails = %v, want none at 40%%", got)
 	}
 
 	// Strict holds every Defined model to the thresholds, so a configured model
 	// with no results breaches per tier where the default gate (above, at 40%)
 	// passes.
-	strict := Check(summary, Thresholds{
+	strict, _ := Check(repo, summary, Thresholds{
 		TriggersMinPassRate: 0.4,
 		Strict:              true,
 		Defined:             []string{"anthropic/claude-fable-5", "openai/gpt-5.5"},
+		Maturity:            gate,
 	})
 	if len(strict) != 2 {
 		t.Fatalf("strict breaches = %v, want missing-results breaches for openai/gpt-5.5", strict)
@@ -350,6 +360,84 @@ func TestCheckThresholds(t *testing.T) {
 		if !strings.Contains(b, "openai/gpt-5.5") {
 			t.Errorf("strict breach = %q, want it to name openai/gpt-5.5", b)
 		}
+	}
+
+	// An empty gated set (built-in default's zero value here, since the test
+	// constructs Thresholds directly) never fails, but still surfaces the same
+	// issues as warnings — evidence is not silently dropped for a non-gated plugin.
+	_, warnsOnly := Check(repo, summary, Thresholds{TriggersMinPassRate: 0.8})
+	if len(warnsOnly) != 1 || !strings.Contains(warnsOnly[0], "anthropic/claude-fable-5") {
+		t.Errorf("warns = %v, want the same issue demoted to warn when ungated", warnsOnly)
+	}
+}
+
+// staleEvalRepo builds a single-plugin (0.1.0) repo whose one eval's stored
+// SpecHash cannot match its authored definition, so run.StaleTiers reports the
+// evals tier stale. Pass rates are fine, isolating the staleness gate.
+func staleEvalRepo(t *testing.T) *layout.Repo {
+	t.Helper()
+	root := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".claude-plugin/plugin.json", `{"name":"solo","version":"0.1.0"}`)
+	write("skills/solo-skill/SKILL.md", "---\nname: solo-skill\n---\nbody\n")
+	write("evals/solo-skill/triggers.json", `{"triggers":[{"query":"q","should_trigger":true}]}`)
+	write("evals/solo-skill/evals.json", `{"evals":[{"id":"basic","prompt":"p","assertions":[{"type":"file_exists","path":"x"}]}]}`)
+
+	f := &results.File{Schema: results.Schema, Plugin: "solo", Skill: "solo-skill"}
+	f.SetEval("anthropic/claude-fable-5", &results.EvalEntry{
+		Header: results.Header{
+			Provider: "anthropic", Model: "claude-fable-5", Display: "Claude Fable 5",
+			ToolVersion: "test", RanAt: "2026-06-11T10:00:00Z", Executed: true,
+		},
+		Summary: results.EvalSummary{Passed: new(1), Failed: new(0), Total: 1, PassRate: new(1.0)},
+		// A non-empty SpecHash that cannot match the freshly hashed authored eval.
+		Results: []results.EvalResult{{ID: "basic", Passed: new(true), SpecHash: "stale-does-not-match"}},
+	})
+	if _, err := f.SaveDir(filepath.Join(root, "evals", "solo-skill"), "json"); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := layout.Detect(root, layout.Auto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo
+}
+
+// TestCheckStaleEvidenceStrictOnly pins the gate's --strict scoping: stale
+// evidence is inspected only under --strict (a plain --check stays a pass-rate
+// gate), and under --strict the stale issue fails a gated plugin but warns an
+// ungated one.
+func TestCheckStaleEvidenceStrictOnly(t *testing.T) {
+	repo := staleEvalRepo(t)
+	summary, err := Generate(Options{Repo: repo, ToolVersion: "test", Models: model.AllModels(nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := []Maturity{MaturityUnstable} // the plugin is 0.1.0
+
+	// Plain --check does not inspect staleness: no fails, no warns.
+	if fails, warns := Check(repo, summary, Thresholds{Maturity: gate}); len(fails) != 0 || len(warns) != 0 {
+		t.Fatalf("non-strict: fails=%v warns=%v, want none (staleness is --strict only)", fails, warns)
+	}
+
+	// --strict surfaces the stale eval evidence; the gated plugin fails on it.
+	fails, _ := Check(repo, summary, Thresholds{Strict: true, Maturity: gate})
+	if len(fails) != 1 || !strings.Contains(fails[0], "stale") || !strings.Contains(fails[0], "solo-skill") {
+		t.Fatalf("strict gated: fails=%v, want one stale-evidence breach for solo-skill", fails)
+	}
+
+	// The same strict issue is demoted to a warning for an ungated maturity.
+	if _, warns := Check(repo, summary, Thresholds{Strict: true, Maturity: []Maturity{MaturityStable}}); len(warns) != 1 || !strings.Contains(warns[0], "stale") {
+		t.Fatalf("strict ungated: warns=%v, want the stale issue demoted to warn", warns)
 	}
 }
 

@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/spf13/viper"
@@ -25,6 +26,9 @@ func TestThresholdsDefaults(t *testing.T) {
 	}
 	if len(th.Models) != 0 {
 		t.Errorf("Models = %v, want empty", th.Models)
+	}
+	if !slices.Equal(th.Maturity, report.DefaultGatedMaturity) {
+		t.Errorf("Maturity = %v, want default %v", th.Maturity, report.DefaultGatedMaturity)
 	}
 }
 
